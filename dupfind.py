@@ -52,7 +52,9 @@ def parse_arguments():
                        help="set the amount of displayed duplicates. If 0 is given, all results will be displayed. default=10")
     parser.add_argument("--hidden", dest="include_hidden", action="store_true", help="check hidden files and hidden directories too")
     parser.add_argument("--empty", dest="include_empty", action="store_true", help="check empty files too")
-    parser.add_argument("--nameonly", dest="nameonly", action="store_true", help="Only check name and size and simple hash, no full hash")
+    parser.add_argument("--name", dest="name", action="store_true", help="name must match")
+    parser.add_argument("--crc", dest="crc", action="store_true", help="match adler32 of first 1k of file")
+    parser.add_argument("--sha", dest="sha", action="store_true", help="match sha256 hash of file")
     args = parser.parse_args()
     if args.show_all or args.top == 0:
         args.top = None
@@ -61,7 +63,7 @@ def parse_arguments():
 
 def print_duplicates(files, displaycount=None):
     """Prints a list of duplicates."""
-    with open('duplicate.json', 'w') as f:
+    with open('duplicates.pkl', 'w') as f:
         pickle.dump(files, f)
     sortedfiles = sorted(files, key=lambda x: (len(x), os.path.getsize(x[0])), reverse=True)
     f = open('duplicate_files.txt', 'w')
@@ -86,52 +88,58 @@ def get_crc_key(filename):
         chunk = inputfile.read(1024)
     return zlib.adler32(chunk)
 
-def filter_duplicate_files(files, top=None, nameonly=False):
-    """Finds all duplicate files in the directory."""
-    duplicates = {}
+def filter_duplicate_files(files, top=None, name=False, crc=True, sha=False):
+    """
+       Finds all duplicate files in the directory.
+       After each round, found duplicates will be put into buckets.
+       Next round will only look for duplciates within each bucket instead of all files.
+       Initially, all file is in one single bucket.
+    """
     update = UpdatePrinter.UpdatePrinter().update
-    iterations = ((os.path.getsize, "By Size", top**2 if top else None),  # top * top <-- this could be performance optimized further by top*3 or top*4
-                  (get_crc_key, "By CRC ", top*2 if top else None),       # top * 2
-                  (get_hash_key, "By Hash", None))
-    if nameonly:
-        iterations = iterations[:2]
-    
+    iterations = []
+    if name:
+        iterations.append((os.path.basename, 'By Name', None))
+    iterations.append((os.path.getsize, "By Size", top**2 if top else None))  # top * top <-- this could be performance optimized further by top*3 or top*4
+    if crc:
+        iterations.append((get_crc_key, "By CRC ", top*2 if top else None))   # top * 2
+    if sha:
+        iterations.append((get_hash_key, "By Hash", None))
+
+    buckets = [files]  # put initial files in one bucket since they can all match
+    duplicates = {}
     for keyfunction, name, topcount in iterations:
-        duplicates.clear()
+        new_buckets = []
         count = 0
         duplicate_count = 0
-        i = 0
-        for i, filepath in enumerate(files, start=1):
-            try:
-                key = keyfunction(filepath)
-            except Exception as e:
-                print(e)
-                continue
-                
-            duplicates.setdefault(key, []).append(filepath)
-            if len(duplicates[key]) > 1:
-                count += 1
-                if len(duplicates[key]) == 2:
-                    count += 1
-                    duplicate_count += 1
-
-            update("\r(%s) %d Files checked, %d duplicates found (%d files)" % (name, i, duplicate_count, count))
-        else:
-            update("\r(%s) %d Files checked, %d duplicates found (%d files)" % (name, i, duplicate_count, count), force=True)
-        
-        print ""
-        sortedfiles = sorted(duplicates.itervalues(), key=len, reverse=True)
-        files = [filepath for filepaths in sortedfiles[:topcount] if len(filepaths) > 1 for filepath in filepaths]
-
-    if nameonly:
-        pre = duplicates
-        duplicates = {}
-        for k in pre:
-            for filepath in pre[k]:
-                key = (os.path.basename(filepath), k)
+        inspect_count = 0
+        for bucket in buckets:  # only need to find duplicate within each bucket
+            duplicates.clear()
+            for i, filepath in enumerate(bucket, start=1):
+                try:
+                    key = keyfunction(filepath)
+                except Exception as e:
+                    print(e)
+                    continue
                 duplicates.setdefault(key, []).append(filepath)
+                if len(duplicates[key]) > 1:
+                    count += 1
+                    if len(duplicates[key]) == 2:
+                        count += 1
+                        duplicate_count += 1
+                inspect_count += 1
 
-    return [filelist for filelist in duplicates.itervalues() if len(filelist) > 1]
+                update("\r(%s) %d Files checked, %d duplicates found (%d files)" % (name, inspect_count, duplicate_count, count))
+            else:
+                update("\r(%s) %d Files checked, %d duplicates found (%d files)" % (name, inspect_count, duplicate_count, count), force=True)
+            # save duplicate from this bucket, before working on the next
+            new_buckets.extend(duplicates.itervalues())
+        # prepare for the next round:
+        buckets = sorted(new_buckets,   key=len, reverse=True)
+        buckets = [bucket for bucket in buckets if len(bucket) > 1]
+        print ""
+
+    return buckets
+
 
 def get_files(directory, include_hidden, include_empty):
     """Returns all FILES in the directory which apply to the filter rules."""
@@ -139,20 +147,18 @@ def get_files(directory, include_hidden, include_empty):
     return (os.path.join(dirpath, filename)
             for dirpath, _, filenames in os.walk(directory)
             for filename in filenames
-                if not os.path.islink(os.path.join(dirpath, filename)) and not os.path.basename(filename) in ignore and not 'RECYCLE.BIN' in dirpath
+                if not os.path.islink(os.path.join(dirpath, filename)) and not os.path.basename(filename) in ignore and 'RECYCLE.BIN' not in dirpath
                 and (include_hidden or
                      reduce(lambda r, d: r and not d.startswith("."), os.path.abspath(os.path.join(dirpath, filename)).split(os.sep), True))
                 and (include_empty or os.path.getsize(os.path.join(dirpath, filename)) > 0))
 
 if __name__ == "__main__":
     ARGS = parse_arguments()
+    print "Scanning {}".format(ARGS.directory)
     FILES = []
-    print ARGS
     for directory in ARGS.directory:
-        print ARGS.directory
-        exit(1)
-        FILES.extend(get_files(directory, ARGS.include_hidden, ARGS.include_empty))
-    DUPLICATES = filter_duplicate_files(FILES, ARGS.top if ARGS.fast else None, ARGS.nameonly)
+        FILES.extend(get_files(unicode(directory), ARGS.include_hidden, ARGS.include_empty))
+    DUPLICATES = filter_duplicate_files(FILES, ARGS.top if ARGS.fast else None, ARGS.name, ARGS.crc, ARGS.sha)
     print_duplicates(DUPLICATES, ARGS.top)
     
     if ARGS.fast:
